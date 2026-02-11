@@ -630,6 +630,7 @@ class StreamChecker:
                 except Exception as e:
                     logger.error(f"处理链接失败 {line}: {e}")
                     failed_list.append(line)
+                    failed_count += 1
         
         # 按响应时间排序成功列表
         success_list.sort(key=lambda x: float(x.split(',')[0].replace('ms', '')))
@@ -841,11 +842,11 @@ class StreamChecker:
 
         # 准备超时列表
         timeout_output = [
-                "更新时间,#genre#",
-                version,
-                "",
-                "timeout,#genre#"
-            ] + timeout_list
+            "更新时间,#genre#",
+            version,
+            "",
+            "timeout,#genre#"
+        ] + timeout_list
         
         # 保存文件
         file_paths = self.get_file_paths()
@@ -853,7 +854,11 @@ class StreamChecker:
         self.write_list(file_paths["whitelist_auto_tv"], success_tv_output)
         self.write_list(file_paths["blacklist_auto"], failed_output)
         self.write_list(file_paths["timelist_auto"], timeout_output)
-
+        
+        logger.info(f"结果已保存:")
+        logger.info(f"  - 成功列表: {len(success_list)}个链接")
+        logger.info(f"  - 失败列表: {len(failed_list)}个链接")
+        logger.info(f"  - 超时列表: {len(timeout_list)}个链接")
     
     def write_list(self, file_path: str, data_list: List[str]):
         """写入列表到文件"""
@@ -913,22 +918,23 @@ class StreamChecker:
         logger.info("=" * 60)
 
 
-    def main():
-        """主函数"""
-        logger.info("开始直播源检测和域名质量分析...")
-        logger.info(f"配置: 超时={Config.TIMEOUT_CHECK}s, 线程={Config.MAX_WORKERS}, 重试={Config.MAX_RETRIES}")
-        
-        checker = StreamChecker()
+def main():
+    """主函数"""
+    logger.info("开始直播源检测和域名质量分析...")
+    logger.info(f"配置: 超时={Config.TIMEOUT_CHECK}s, 线程={Config.MAX_WORKERS}, 重试={Config.MAX_RETRIES}")
+    logger.info(f"智能检测: {'启用' if Config.ENABLE_SMART_DETECTION else '禁用'}")
     
-        try:
-            checker.run()
-        except KeyboardInterrupt:
-            logger.info("检测被用户中断")
-        except Exception as e:
-            logger.error(f"检测过程发生错误: {e}", exc_info=True)
-        finally:
-            logger.info("检测结束")
+    checker = StreamChecker()
+    
+    try:
+        checker.run()
+    except KeyboardInterrupt:
+        logger.info("检测被用户中断")
+    except Exception as e:
+        logger.error(f"检测过程发生错误: {e}", exc_info=True)
+    finally:
+        logger.info("检测结束")
 
 
-    if __name__ == "__main__":
-        main()
+if __name__ == "__main__":
+    main()
