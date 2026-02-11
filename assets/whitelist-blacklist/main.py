@@ -36,7 +36,7 @@ class Config:
     # 远程URL内容超时
     TIMEOUT_FETCH = 10
     # 每个直播源超时
-    TIMEOUT_CHECK = 8
+    TIMEOUT_CHECK = 5
     # 只控制建立连接的时间，不包括数据传输超时
     TIMEOUT_CONNECT = 5
     
