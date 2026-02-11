@@ -112,31 +112,24 @@ def check_http_url_with_ip_version(url, timeout, ip_version):
         return False
 
 def check_http_url(url, timeout):
-    """优化的HTTP/HTTPS链接检测逻辑：先判断IP类型再检测"""
+    """优化的HTTP/HTTPS链接检测逻辑：仅使用对应IP版本检测，不降级"""
     try:
         # 获取主机地址
         host = get_host_from_url(url)
         
         # 1. 判断IP类型
         if is_ipv6_address(host):
-            # URL中明确是IPv6地址，优先用IPv6检测
-            if check_http_url_with_ip_version(url, timeout, 6):
-                return True
-            # IPv6检测失败，尝试IPv4降级
-            return check_http_url_with_ip_version(url, timeout, 4)
+            # URL是IPv6地址，仅检测IPv6，失败不降级
+            return check_http_url_with_ip_version(url, timeout, 6)
             
         elif is_ipv4_address(host):
-            # URL中明确是IPv4地址，优先用IPv4检测
-            if check_http_url_with_ip_version(url, timeout, 4):
-                return True
-            # IPv4检测失败，尝试IPv6降级
-            return check_http_url_with_ip_version(url, timeout, 6)
+            # URL是IPv4地址，仅检测IPv4，失败不降级
+            return check_http_url_with_ip_version(url, timeout, 4)
             
         else:
-            # 域名形式，先尝试IPv4，失败再尝试IPv6
-            if check_http_url_with_ip_version(url, timeout, 4):
-                return True
-            return check_http_url_with_ip_version(url, timeout, 6)
+            # 域名形式，先尝试IPv4（无降级）
+            # 注意：域名场景下仅检测IPv4，如需优先IPv6可修改此处
+            return check_http_url_with_ip_version(url, timeout, 4)
             
     except urllib.error.HTTPError as e:
         return False
@@ -164,22 +157,22 @@ def check_rtmp_rtsp_url(url, timeout):
         return False
 
 def check_rtp_url(url, timeout):
-    """优化的RTP检测逻辑"""
+    """优化的RTP检测逻辑：仅使用对应IP版本检测，不降级"""
     try:
         parsed = urlparse(url)
         host, port = parsed.hostname, parsed.port
         if not host or not port:
             return False
         
-        # 判断IP类型
+        # 判断IP类型，仅使用对应类型检测
         if is_ipv6_address(host):
-            # IPv6地址
+            # IPv6地址，仅用IPv6 socket
             with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as s:
                 s.settimeout(timeout)
                 s.connect((host, port))
                 return True
         else:
-            # IPv4地址
+            # IPv4地址或域名，仅用IPv4 socket
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
                 s.settimeout(timeout)
                 s.connect((host, port))
@@ -189,14 +182,58 @@ def check_rtp_url(url, timeout):
     except Exception:
         return False
 
-def check_custom_protocol_url(url, timeout):
-    """自定义协议（P3P/P2P）的兼容检测"""
-    # 如果有具体的P3P/P2P检测规则，替换这里的逻辑
-    # 暂时返回None表示不判定，避免误杀
-    return None
+def check_p3p_url(url, timeout):
+    try:
+        parsed = urlparse(url)
+        host, port = parsed.hostname, parsed.port or 80
+        path = parsed.path or "/"
+        if not host or not port:
+            return False
+        
+        # 判断IP类型，使用对应socket类型
+        if is_ipv6_address(host):
+            s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        else:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            
+        with s:
+            s.settimeout(timeout)
+            s.connect((host, port))
+            request = (
+                f"GET {path} P3P/1.0\r\n"
+                f"Host: {host}\r\n"
+                f"User-Agent: {USER_AGENT}\r\n"
+                f"Connection: close\r\n\r\n"
+            )
+            s.sendall(request.encode())
+            return True
+    except Exception:
+        return False
+
+def check_p2p_url(url, timeout):
+    try:
+        parsed = urlparse(url)
+        host, port, path = parsed.hostname, parsed.port, parsed.path
+        if not host or not port or not path:
+            return False
+        
+        # 判断IP类型，使用对应socket类型
+        if is_ipv6_address(host):
+            s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+        else:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            
+        with s:
+            s.settimeout(timeout)
+            s.connect((host, port))
+            request = f"YOUR_CUSTOM_REQUEST {path}\r\nHost: {host}\r\n\r\n"
+            s.sendall(request.encode())
+            return b"SOME_EXPECTED_RESPONSE" in s.recv(1024)
+    except Exception:
+        return False
 
 def check_url(url, timeout=TIMEOUT_CHECK):
-    """重构的链接检测函数，先判断IP类型再检测"""
+    """重构的链接检测函数：仅使用对应IP版本检测，不降级"""
     try:
         # 统一URL编码处理
         encoded_url = quote(unquote(url), safe=':/?&=')
@@ -209,8 +246,10 @@ def check_url(url, timeout=TIMEOUT_CHECK):
             is_valid = check_rtmp_rtsp_url(encoded_url, timeout)
         elif url.startswith("rtp"):
             is_valid = check_rtp_url(encoded_url, timeout)
-        elif url.startswith(("p3p", "p2p")):
-            is_valid = check_custom_protocol_url(encoded_url, timeout)
+        elif url.startswith("p3p"):
+            is_valid = check_p3p_url(encoded_url, timeout)
+        elif url.startswith("p2p"):
+            is_valid = check_p2p_url(encoded_url, timeout)
         else:
             # 未知协议，标记为失效
             is_valid = False
