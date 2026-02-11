@@ -11,10 +11,12 @@ timestart = datetime.now()
 # 优化用户代理，使用更通用的浏览器标识
 USER_AGENT_URL = "PostmanRuntime-ApipostRuntime/1.1.0"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-# 增加超时时间，减少网络波动导致的误判
-TIMEOUT_CHECK = 10
-TIMEOUT_FETCH = 10
-MAX_WORKERS = 30
+# 源链接超时
+TIMEOUT_FETCH = 5
+# 数据请求超时
+TIMEOUT_CHECK = 5
+# 请求线程数
+MAX_WORKERS = 50
 blacklist_dict = {}
 urls_all_lines = []
 url_statistics = []
@@ -49,17 +51,43 @@ def get_host_from_url(url):
     host = parsed.netloc
     if host.startswith('[') and host.endswith(']'):
         host = host[1:-1]
+    # 处理端口号
+    if ':' in host and not host.count(':') > 1:  # 排除IPv6地址中的冒号
+        host = host.split(':')[0]
     return host
+
+def is_ipv6_address(ip):
+    """判断是否为IPv6地址"""
+    try:
+        socket.inet_pton(socket.AF_INET6, ip)
+        return True
+    except (socket.error, ValueError):
+        return False
+
+def is_ipv4_address(ip):
+    """判断是否为IPv4地址"""
+    try:
+        socket.inet_pton(socket.AF_INET, ip)
+        return True
+    except (socket.error, ValueError):
+        return False
 
 def record_host(host):
     if not host:
         return
     blacklist_dict[host] = blacklist_dict.get(host, 0) + 1
 
-def check_http_url(url, timeout):
-    """优化的HTTP/HTTPS链接检测逻辑"""
+def force_ip_version_resolver(ip_version):
+    """生成指定IP版本的解析器"""
+    def resolver(host, port=80, family=0, type=0, proto=0, flags=0):
+        addr_family = socket.AF_INET6 if ip_version == 6 else socket.AF_INET
+        addrs = socket.getaddrinfo(host, port, addr_family, type, proto, flags)
+        return addrs
+    return resolver
+
+def check_http_url_with_ip_version(url, timeout, ip_version):
+    """指定IP版本检测HTTP/HTTPS链接"""
     try:
-        # 先尝试IPv4，失败再尝试IPv6
         req = urllib.request.Request(
             url, 
             headers={
@@ -68,15 +96,51 @@ def check_http_url(url, timeout):
                 "Connection": "close"
             }
         )
-        # 不强制IPv6，使用系统默认的地址解析
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            # 放宽状态码判断，2xx都算有效
-            return 200 <= resp.status < 300
+        
+        # 保存原始解析器
+        original_getaddrinfo = socket.getaddrinfo
+        try:
+            # 强制使用指定的IP版本
+            socket.getaddrinfo = force_ip_version_resolver(ip_version)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return 200 <= resp.status < 300
+        finally:
+            # 恢复原始解析器
+            socket.getaddrinfo = original_getaddrinfo
+            
+    except Exception:
+        return False
+
+def check_http_url(url, timeout):
+    """优化的HTTP/HTTPS链接检测逻辑：先判断IP类型再检测"""
+    try:
+        # 获取主机地址
+        host = get_host_from_url(url)
+        
+        # 1. 判断IP类型
+        if is_ipv6_address(host):
+            # URL中明确是IPv6地址，优先用IPv6检测
+            if check_http_url_with_ip_version(url, timeout, 6):
+                return True
+            # IPv6检测失败，尝试IPv4降级
+            return check_http_url_with_ip_version(url, timeout, 4)
+            
+        elif is_ipv4_address(host):
+            # URL中明确是IPv4地址，优先用IPv4检测
+            if check_http_url_with_ip_version(url, timeout, 4):
+                return True
+            # IPv4检测失败，尝试IPv6降级
+            return check_http_url_with_ip_version(url, timeout, 6)
+            
+        else:
+            # 域名形式，先尝试IPv4，失败再尝试IPv6
+            if check_http_url_with_ip_version(url, timeout, 4):
+                return True
+            return check_http_url_with_ip_version(url, timeout, 6)
+            
     except urllib.error.HTTPError as e:
-        # 4xx/5xx确实是链接失效
         return False
     except (urllib.error.URLError, socket.timeout, ConnectionResetError):
-        # 网络超时/连接重置，不直接判定失效，返回None表示未知
         return None
     except Exception:
         return False
@@ -107,11 +171,19 @@ def check_rtp_url(url, timeout):
         if not host or not port:
             return False
         
-        # RTP是UDP协议，不需要等待返回数据，能连接就表示有效
-        with socket.socket(socket.AF_UNSPEC, socket.SOCK_DGRAM) as s:
-            s.settimeout(timeout)
-            s.connect((host, port))
-            return True
+        # 判断IP类型
+        if is_ipv6_address(host):
+            # IPv6地址
+            with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as s:
+                s.settimeout(timeout)
+                s.connect((host, port))
+                return True
+        else:
+            # IPv4地址
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.settimeout(timeout)
+                s.connect((host, port))
+                return True
     except socket.timeout:
         return None
     except Exception:
@@ -124,7 +196,7 @@ def check_custom_protocol_url(url, timeout):
     return None
 
 def check_url(url, timeout=TIMEOUT_CHECK):
-    """重构的链接检测函数，减少误判"""
+    """重构的链接检测函数，先判断IP类型再检测"""
     try:
         # 统一URL编码处理
         encoded_url = quote(unquote(url), safe=':/?&=')
@@ -353,8 +425,6 @@ if __name__ == "__main__":
     elapsed = end_time - timestart
     mins, secs = int(elapsed.total_seconds() // 60), int(elapsed.total_seconds() % 60)
     print("="*50)
-    print(f"Start time: {timestart.strftime('%Y%m%d %H:%M:%S')}")
-    print(f"End time: {end_time.strftime('%Y%m%d %H:%M:%S')}")
     print(f"Elapsed time: {mins} min {secs} sec")
     print(f"Original count: {len(urls_all_lines)}")
     print(f"Cleaned count: {clean_count}")
