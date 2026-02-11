@@ -5,13 +5,11 @@ from datetime import datetime, timedelta, timezone
 import os
 from urllib.parse import urlparse, quote, unquote
 import socket
-import subprocess
 import json
 import ssl
 import re
 from typing import List, Tuple, Optional, Dict, Any, Set
 import logging
-import hashlib
 from collections import defaultdict
 import statistics
 
@@ -33,29 +31,27 @@ class Config:
     USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     
     # 超时配置
-    # 远程URL内容超时
-    TIMEOUT_FETCH = 10
-    # 每个直播源超时
-    TIMEOUT_CHECK = 5
-    # 只控制建立连接的时间，不包括数据传输超时
-    TIMEOUT_CONNECT = 5
+    TIMEOUT_FETCH = 10          # 远程URL内容获取超时
+    TIMEOUT_CHECK = 5           # 每个直播源检测超时
+    TIMEOUT_CONNECT = 3         # 连接建立超时
+    TIMEOUT_READ = 2            # 数据读取超时
     
     # 线程配置
     MAX_WORKERS = 30
     
     # 重试配置
-    # 重试次数
-    MAX_RETRIES = 0
-    # 重试等待（秒）
-    RETRY_DELAY = 1
+    MAX_RETRIES = 1             # 重试次数（0表示不重试）
+    RETRY_DELAY = 1             # 重试等待（秒）
     
     # 域名评估配置
     MIN_SUCCESS_RATE = 0.8      # 最低成功率（优秀域名）
     MIN_SAMPLES = 3             # 最少样本数
     MAX_RESPONSE_TIME = 2000    # 最大响应时间(ms)
     
-    # 缓存配置
-    CACHE_EXPIRE_HOURS = 24
+    # 检测策略
+    ENABLE_SMART_DETECTION = True  # 启用智能检测
+    SKIP_TIMEOUT_URLS = False      # 是否跳过超时URL（False表示超时算失败）
+
 
 class DomainAnalyzer:
     """域名分析器"""
@@ -65,13 +61,16 @@ class DomainAnalyzer:
             'total_count': 0,
             'response_times': [],
             'urls': set(),
-            'last_check': None
+            'last_check': None,
+            'timeout_count': 0
         })
         self.excellent_domains: Set[str] = set()
         self.good_domains: Set[str] = set()
         self.poor_domains: Set[str] = set()
+        self.unstable_domains: Set[str] = set()  # 超时率高的不稳定域名
     
-    def record_domain_result(self, domain: str, url: str, success: bool, response_time: Optional[float]):
+    def record_domain_result(self, domain: str, url: str, success: Optional[bool], 
+                           response_time: Optional[float], timeout: bool = False):
         """记录域名检测结果"""
         if not domain:
             return
@@ -80,10 +79,12 @@ class DomainAnalyzer:
         stats['total_count'] += 1
         stats['urls'].add(url)
         
-        if success:
+        if success is True:
             stats['success_count'] += 1
             if response_time:
                 stats['response_times'].append(response_time)
+        elif timeout:
+            stats['timeout_count'] += 1
         
         stats['last_check'] = datetime.now().isoformat()
     
@@ -94,8 +95,15 @@ class DomainAnalyzer:
         if stats['total_count'] < Config.MIN_SAMPLES:
             return 0.0, {'reason': '样本不足'}
         
-        # 计算成功率
-        success_rate = stats['success_count'] / stats['total_count']
+        # 计算成功率（排除超时）
+        valid_checks = stats['total_count'] - stats['timeout_count']
+        if valid_checks == 0:
+            return 0.0, {'reason': '无有效检测'}
+        
+        success_rate = stats['success_count'] / valid_checks if valid_checks > 0 else 0
+        
+        # 计算超时率
+        timeout_rate = stats['timeout_count'] / stats['total_count'] if stats['total_count'] > 0 else 0
         
         # 计算平均响应时间
         avg_response = 0
@@ -106,26 +114,34 @@ class DomainAnalyzer:
         stability = 1.0
         if len(stats['response_times']) > 1:
             std_dev = statistics.stdev(stats['response_times'])
-            # 标准差越小越好，归一化到0-1
             stability = max(0, 1 - (std_dev / 1000))
         
         # 计算覆盖率（URL数量）
-        url_coverage = min(1.0, len(stats['urls']) / 20)  # 最多20个URL得满分
+        url_coverage = min(1.0, len(stats['urls']) / 20)
+        
+        # 超时惩罚
+        timeout_penalty = timeout_rate * 0.3  # 超时率高的域名扣分
         
         # 综合评分
         score = (
             success_rate * 0.5 +          # 成功率权重50%
-            (1 - min(1, avg_response / Config.MAX_RESPONSE_TIME)) * 0.3 +  # 速度权重30%
-            stability * 0.1 +             # 稳定性权重10%
-            url_coverage * 0.1            # 覆盖率权重10%
+            (1 - min(1, avg_response / Config.MAX_RESPONSE_TIME)) * 0.2 +  # 速度权重20%
+            stability * 0.15 +            # 稳定性权重15%
+            url_coverage * 0.1 -          # 覆盖率权重10%
+            timeout_penalty               # 超时惩罚
         )
+        
+        # 确保分数在0-1之间
+        score = max(0, min(1, score))
         
         metrics = {
             'success_rate': success_rate,
+            'timeout_rate': timeout_rate,
             'avg_response': avg_response,
             'stability': stability,
             'url_count': len(stats['urls']),
-            'total_checks': stats['total_count']
+            'total_checks': stats['total_count'],
+            'timeout_checks': stats['timeout_count']
         }
         
         return score, metrics
@@ -135,9 +151,14 @@ class DomainAnalyzer:
         self.excellent_domains.clear()
         self.good_domains.clear()
         self.poor_domains.clear()
+        self.unstable_domains.clear()
         
         for domain in self.domain_stats.keys():
             score, metrics = self.calculate_domain_score(domain)
+            
+            # 超时率超过30%标记为不稳定
+            if metrics['timeout_rate'] > 0.3:
+                self.unstable_domains.add(domain)
             
             if score >= 0.8:
                 self.excellent_domains.add(domain)
@@ -155,6 +176,7 @@ class DomainAnalyzer:
                 'domain': domain,
                 'score': round(score, 3),
                 'success_rate': round(metrics['success_rate'] * 100, 1),
+                'timeout_rate': round(metrics['timeout_rate'] * 100, 1),
                 'avg_response': round(metrics['avg_response'], 1),
                 'url_count': metrics['url_count'],
                 'total_checks': metrics['total_checks']
@@ -171,14 +193,17 @@ class DomainAnalyzer:
             'excellent_domains': list(self.excellent_domains),
             'good_domains': list(self.good_domains),
             'poor_domains': list(self.poor_domains),
+            'unstable_domains': list(self.unstable_domains),
             'detailed_stats': {
                 domain: {
                     'success_count': stats['success_count'],
                     'total_count': stats['total_count'],
-                    'success_rate': round(stats['success_count'] / stats['total_count'] * 100, 1),
+                    'timeout_count': stats['timeout_count'],
+                    'success_rate': round(stats['success_count'] / max(1, stats['total_count'] - stats['timeout_count']) * 100, 1),
+                    'timeout_rate': round(stats['timeout_count'] / stats['total_count'] * 100, 1) if stats['total_count'] > 0 else 0,
                     'avg_response': round(statistics.mean(stats['response_times']), 2) if stats['response_times'] else 0,
                     'url_count': len(stats['urls']),
-                    'sample_urls': list(stats['urls'])[:3]  # 只保存前3个示例URL
+                    'sample_urls': list(stats['urls'])[:3]
                 }
                 for domain, stats in self.domain_stats.items()
                 if stats['total_count'] >= Config.MIN_SAMPLES
@@ -193,54 +218,16 @@ class DomainAnalyzer:
         except Exception as e:
             logger.error(f"保存域名分析结果失败: {e}")
 
+
 class StreamChecker:
     def __init__(self):
         self.timestart = datetime.now()
         self.url_statistics: List[str] = []
-        self.success_cache: Dict[str, Tuple[float, datetime]] = {}
-        self.failed_cache: Dict[str, datetime] = {}
         self.domain_analyzer = DomainAnalyzer()
-        self.cache_file = "check_cache.json"
-        self.load_cache()
         
-    def load_cache(self):
-        """加载检测缓存"""
-        try:
-            if os.path.exists(self.cache_file):
-                with open(self.cache_file, 'r', encoding='utf-8') as f:
-                    cache_data = json.load(f)
-                    for url, data in cache_data.get('success', {}).items():
-                        cache_time = datetime.fromisoformat(data['time'])
-                        if (datetime.now() - cache_time).total_seconds() < Config.CACHE_EXPIRE_HOURS * 3600:
-                            self.success_cache[url] = (data['elapsed'], cache_time)
-                    for url, cache_time_str in cache_data.get('failed', {}).items():
-                        cache_time = datetime.fromisoformat(cache_time_str)
-                        if (datetime.now() - cache_time).total_seconds() < Config.CACHE_EXPIRE_HOURS * 3600:
-                            self.failed_cache[url] = cache_time
-        except Exception as e:
-            logger.warning(f"加载缓存失败: {e}")
-    
-    def save_cache(self):
-        """保存检测缓存"""
-        try:
-            cache_data = {
-                'success': {
-                    url: {'elapsed': elapsed, 'time': cache_time.isoformat()}
-                    for url, (elapsed, cache_time) in self.success_cache.items()
-                },
-                'failed': {
-                    url: cache_time.isoformat()
-                    for url, cache_time in self.failed_cache.items()
-                }
-            }
-            with open(self.cache_file, 'w', encoding='utf-8') as f:
-                json.dump(cache_data, f, ensure_ascii=False, indent=2)
-        except Exception as e:
-            logger.warning(f"保存缓存失败: {e}")
-    
-    def get_url_hash(self, url: str) -> str:
-        """生成URL的哈希值用于缓存键"""
-        return hashlib.md5(url.encode('utf-8')).hexdigest()
+        # 域名级缓存（用于智能检测）
+        self.domain_quality_cache: Dict[str, float] = {}  # 域名: 质量分数
+        self.domain_last_check: Dict[str, datetime] = {}  # 域名: 最后检测时间
     
     def get_domain_from_url(self, url: str) -> str:
         """从URL提取域名"""
@@ -248,16 +235,12 @@ class StreamChecker:
             parsed = urlparse(url)
             host = parsed.netloc
             
-            # 处理端口号
             if ':' in host:
-                # IPv6地址处理
                 if host.startswith('[') and ']' in host:
-                    # IPv6地址格式 [::1]:8080
                     ipv6_end = host.find(']')
                     if ipv6_end != -1 and ':' in host[ipv6_end:]:
                         host = host[:ipv6_end + 1]
                 else:
-                    # IPv4地址或域名
                     host = host.split(':')[0]
             
             return host.lower()
@@ -295,9 +278,11 @@ class StreamChecker:
         context.set_ciphers('DEFAULT:@SECLEVEL=1')
         return context
     
-    def check_http_url_with_retry(self, url: str, timeout: int) -> Optional[bool]:
-        """带重试的HTTP/HTTPS检测"""
-        for retry in range(Config.MAX_RETRIES):
+    def check_http_url(self, url: str, timeout: int) -> Tuple[Optional[bool], Optional[float]]:
+        """HTTP/HTTPS检测，返回(状态, 响应时间ms)"""
+        start_time = time.time()
+        
+        for retry in range(Config.MAX_RETRIES + 1):
             try:
                 req = urllib.request.Request(
                     url,
@@ -317,107 +302,162 @@ class StreamChecker:
                     if 200 <= resp.status < 300:
                         # 尝试读取少量数据验证
                         resp.read(512)
-                        return True
-                    return False
+                        elapsed = (time.time() - start_time) * 1000
+                        return True, elapsed
+                    elapsed = (time.time() - start_time) * 1000
+                    return False, elapsed
                     
             except urllib.error.HTTPError as e:
+                elapsed = (time.time() - start_time) * 1000
                 if e.code in [401, 403, 404]:
-                    return False
-                if retry == Config.MAX_RETRIES - 1:
-                    return None
-            except (socket.timeout, urllib.error.URLError):
-                if retry == Config.MAX_RETRIES - 1:
-                    return None
+                    return False, elapsed
+                # 其他HTTP错误，根据重试次数决定
+                if retry == Config.MAX_RETRIES:
+                    return None, elapsed  # 重试次数用完，返回未知
                 time.sleep(Config.RETRY_DELAY)
-            except Exception:
-                if retry == Config.MAX_RETRIES - 1:
-                    return None
+                
+            except (socket.timeout, urllib.error.URLError) as e:
+                elapsed = (time.time() - start_time) * 1000
+                if retry == Config.MAX_RETRIES:
+                    # 判断是超时还是其他错误
+                    if isinstance(e, socket.timeout):
+                        return None, elapsed  # 超时
+                    else:
+                        return False, elapsed  # 其他URL错误
+                time.sleep(Config.RETRY_DELAY)
+                
+            except Exception as e:
+                elapsed = (time.time() - start_time) * 1000
+                if retry == Config.MAX_RETRIES:
+                    logger.debug(f"HTTP检测异常 {url}: {e}")
+                    return False, elapsed
                 time.sleep(Config.RETRY_DELAY)
         
-        return None
+        return None, None
     
-    def check_rtmp_rtsp_url(self, url: str, timeout: int) -> Optional[bool]:
-        """检测RTMP/RTSP链接"""
-        for retry in range(Config.MAX_RETRIES):
+    def check_rtmp_rtsp_url(self, url: str, timeout: int) -> Tuple[Optional[bool], Optional[float]]:
+        """RTMP/RTSP检测，返回(状态, 响应时间ms)"""
+        start_time = time.time()
+        
+        for retry in range(Config.MAX_RETRIES + 1):
             try:
-                # 简化检测：尝试TCP连接
                 parsed = urlparse(url)
-                host, port = parsed.hostname, parsed.port or (1935 if url.startswith('rtmp') else 554)
+                host = parsed.hostname
+                port = parsed.port or (1935 if url.startswith('rtmp') else 554)
                 
                 if not host:
-                    return False
+                    elapsed = (time.time() - start_time) * 1000
+                    return False, elapsed
                 
                 # 创建socket连接
-                sock = socket.create_connection((host, port), timeout=Config.TIMEOUT_CONNECT)
-                sock.close()
-                return True
+                sock = socket.create_connection((host, port), timeout=min(Config.TIMEOUT_CONNECT, timeout))
                 
-            except (socket.timeout, ConnectionRefusedError):
-                if retry == Config.MAX_RETRIES - 1:
-                    return None
+                # 尝试发送简单的协议握手
+                if url.startswith('rtmp'):
+                    # RTMP简单握手尝试
+                    sock.send(b'\x03')
+                    sock.settimeout(2)
+                    try:
+                        data = sock.recv(1)
+                        if data:
+                            sock.close()
+                            elapsed = (time.time() - start_time) * 1000
+                            return True, elapsed
+                    except socket.timeout:
+                        pass
+                
+                elif url.startswith('rtsp'):
+                    # RTSP OPTIONS请求
+                    request = f"OPTIONS {url} RTSP/1.0\r\nCSeq: 1\r\nUser-Agent: {Config.USER_AGENT}\r\n\r\n"
+                    sock.send(request.encode())
+                    sock.settimeout(2)
+                    try:
+                        response = sock.recv(1024)
+                        if b'RTSP/1.0' in response:
+                            sock.close()
+                            elapsed = (time.time() - start_time) * 1000
+                            return True, elapsed
+                    except socket.timeout:
+                        pass
+                
+                sock.close()
+                elapsed = (time.time() - start_time) * 1000
+                return True, elapsed  # 连接成功就算可用
+                
+            except (socket.timeout, ConnectionRefusedError, ConnectionResetError) as e:
+                elapsed = (time.time() - start_time) * 1000
+                if retry == Config.MAX_RETRIES:
+                    if isinstance(e, socket.timeout):
+                        return None, elapsed  # 超时
+                    else:
+                        return False, elapsed  # 连接拒绝
                 time.sleep(Config.RETRY_DELAY)
-            except Exception:
-                if retry == Config.MAX_RETRIES - 1:
-                    return None
+                
+            except Exception as e:
+                elapsed = (time.time() - start_time) * 1000
+                if retry == Config.MAX_RETRIES:
+                    logger.debug(f"RTMP/RTSP检测异常 {url}: {e}")
+                    return False, elapsed
                 time.sleep(Config.RETRY_DELAY)
         
-        return None
+        return None, None
     
-    def check_url(self, url: str) -> Tuple[Optional[float], bool]:
-        """主检测函数"""
-        url_hash = self.get_url_hash(url)
+    def check_url(self, url: str) -> Tuple[Optional[float], Optional[bool]]:
+        """
+        主检测函数
+        返回: (响应时间ms, 状态)
+        状态: True=可用, False=不可用, None=超时/未知
+        """
+        domain = self.get_domain_from_url(url)
         
-        # 检查缓存
-        if url_hash in self.success_cache:
-            elapsed, cache_time = self.success_cache[url_hash]
-            if (datetime.now() - cache_time).total_seconds() < 3600:
-                return elapsed, True
-        
-        if url_hash in self.failed_cache:
-            cache_time = self.failed_cache[url_hash]
-            if (datetime.now() - cache_time).total_seconds() < 1800:
-                return None, False
+        # 智能检测：如果域名质量很差，可以快速失败
+        if Config.ENABLE_SMART_DETECTION and domain:
+            if domain in self.domain_analyzer.unstable_domains:
+                # 不稳定域名，设置更短的超时
+                check_timeout = min(Config.TIMEOUT_CHECK, 2)
+            else:
+                check_timeout = Config.TIMEOUT_CHECK
+        else:
+            check_timeout = Config.TIMEOUT_CHECK
         
         start_time = time.time()
-        result = None
+        status = None
+        response_time = None
         
         try:
             encoded_url = quote(unquote(url), safe=':/?&=#')
             
             if url.startswith(("http://", "https://")):
-                result = self.check_http_url_with_retry(encoded_url, Config.TIMEOUT_CHECK)
+                status, response_time = self.check_http_url(encoded_url, check_timeout)
             elif url.startswith(("rtmp://", "rtsp://")):
-                result = self.check_rtmp_rtsp_url(encoded_url, Config.TIMEOUT_CHECK)
+                status, response_time = self.check_rtmp_rtsp_url(encoded_url, check_timeout)
             else:
                 # 其他协议尝试TCP连接
                 parsed = urlparse(url)
                 host, port = parsed.hostname, parsed.port or 80
                 if host:
-                    socket.create_connection((host, port), timeout=Config.TIMEOUT_CONNECT)
-                    result = True
+                    try:
+                        sock = socket.create_connection((host, port), timeout=Config.TIMEOUT_CONNECT)
+                        sock.close()
+                        response_time = (time.time() - start_time) * 1000
+                        status = True
+                    except Exception:
+                        response_time = (time.time() - start_time) * 1000
+                        status = False
         
-        except Exception:
-            result = False
+        except Exception as e:
+            response_time = (time.time() - start_time) * 1000
+            logger.debug(f"检测异常 {url}: {e}")
+            status = False
         
-        elapsed = (time.time() - start_time) * 1000 if result else None
-        
-        # 更新缓存
-        if result is True:
-            self.success_cache[url_hash] = (elapsed, datetime.now())
-        elif result is False:
-            self.failed_cache[url_hash] = datetime.now()
-        
-        # 记录域名统计
-        domain = self.get_domain_from_url(url)
+        # 记录域名统计（区分超时）
+        timeout = (status is None)
         if domain:
-            self.domain_analyzer.record_domain_result(domain, url, result is True, elapsed)
+            self.domain_analyzer.record_domain_result(
+                domain, url, status, response_time, timeout
+            )
         
-        if result is True:
-            return elapsed, True
-        elif result is False:
-            return None, False
-        else:
-            return elapsed, True  # 超时未知暂时算成功
+        return response_time, status
     
     def process_m3u_content(self, text: str, source_url: str) -> List[str]:
         """处理M3U格式内容"""
@@ -513,14 +553,18 @@ class StreamChecker:
         
         return unique_lines
     
-    def process_batch_urls(self, lines: List[str], whitelist: set) -> Tuple[List[str], List[str]]:
-        """批量处理URL检测"""
+    def process_batch_urls(self, lines: List[str], whitelist: set) -> Tuple[List[str], List[str], List[str]]:
+        """
+        批量处理URL检测
+        返回: (成功列表, 失败列表, 超时列表)
+        """
         success_list = []
         failed_list = []
+        timeout_list = []
         total = len(lines)
         
         if not lines:
-            return success_list, failed_list
+            return success_list, failed_list, timeout_list
         
         logger.info(f"开始检测 {total} 个链接")
         
@@ -534,34 +578,52 @@ class StreamChecker:
             
             processed = 0
             success_count = 0
+            timeout_count = 0
             
             for future in as_completed(futures):
                 idx, line, url = futures[future]
                 processed += 1
                 
                 try:
-                    elapsed, is_valid = future.result()
+                    response_time, status = future.result()
                     
-                    if url in whitelist or is_valid:
-                        if elapsed is not None:
-                            success_list.append(f"{elapsed:.2f}ms,{line}")
-                        else:
-                            success_list.append(f"0.00ms,{line}")
+                    # 白名单强制成功
+                    if url in whitelist:
+                        elapsed_str = f"{response_time or 0:.2f}ms" if response_time else "0.00ms"
+                        success_list.append(f"{elapsed_str},{line}")
                         success_count += 1
-                    else:
+                        continue
+                    
+                    if status is True:
+                        # 可用
+                        elapsed_str = f"{response_time:.2f}ms" if response_time else "0.00ms"
+                        success_list.append(f"{elapsed_str},{line}")
+                        success_count += 1
+                    elif status is False:
+                        # 不可用
                         failed_list.append(line)
+                    elif status is None:
+                        # 超时/未知
+                        timeout_list.append(line)
+                        timeout_count += 1
+                        # 根据配置决定超时的处理方式
+                        if not Config.SKIP_TIMEOUT_URLS:
+                            # 超时算失败
+                            failed_list.append(line)
+                        # 如果SKIP_TIMEOUT_URLS为True，则超时URL不会进入任何列表
                     
                     if processed % 50 == 0 or processed == total:
-                        logger.info(f"进度: {processed}/{total} | 成功: {success_count}")
+                        logger.info(f"进度: {processed}/{total} | 成功: {success_count} | 超时: {timeout_count}")
                         
                 except Exception as e:
                     logger.error(f"处理链接失败 {line}: {e}")
                     failed_list.append(line)
         
+        # 按响应时间排序成功列表
         success_list.sort(key=lambda x: float(x.split(',')[0].replace('ms', '')))
         
-        logger.info(f"检测完成 - 成功: {len(success_list)}, 失败: {len(failed_list)}")
-        return success_list, failed_list
+        logger.info(f"检测完成 - 成功: {len(success_list)}, 失败: {len(failed_list)}, 超时: {len(timeout_list)}")
+        return success_list, failed_list, timeout_list
     
     def print_excellent_domains_report(self):
         """打印优秀域名报告"""
@@ -578,16 +640,16 @@ class StreamChecker:
         logger.info("=" * 80)
         logger.info("优秀域名排行榜 (基于成功率、速度和稳定性)")
         logger.info("=" * 80)
-        logger.info(f"{'排名':<4} {'域名':<40} {'综合评分':<8} {'成功率':<8} {'平均响应':<10} {'URL数量':<8}")
+        logger.info(f"{'排名':<4} {'域名':<40} {'综合评分':<8} {'成功率':<8} {'超时率':<8} {'平均响应':<10}")
         logger.info("-" * 80)
         
-        for idx, domain_info in enumerate(excellent_report[:20], 1):  # 显示前20名
+        for idx, domain_info in enumerate(excellent_report[:20], 1):
             logger.info(
                 f"{idx:<4} {domain_info['domain'][:38]:<40} "
                 f"{domain_info['score']:<8.3f} "
                 f"{domain_info['success_rate']:<7.1f}% "
-                f"{domain_info['avg_response']:<9.1f}ms "
-                f"{domain_info['url_count']:<8}"
+                f"{domain_info['timeout_rate']:<7.1f}% "
+                f"{domain_info['avg_response']:<9.1f}ms"
             )
         
         logger.info("=" * 80)
@@ -596,12 +658,14 @@ class StreamChecker:
         total_domains = len(self.domain_analyzer.domain_stats)
         excellent_count = len(self.domain_analyzer.excellent_domains)
         good_count = len(self.domain_analyzer.good_domains)
+        unstable_count = len(self.domain_analyzer.unstable_domains)
         
         logger.info("域名质量统计:")
         logger.info(f"  总域名数: {total_domains}")
-        logger.info(f"  优秀域名: {excellent_count} ({excellent_count/total_domains*100:.1f}%)")
-        logger.info(f"  良好域名: {good_count} ({good_count/total_domains*100:.1f}%)")
-        logger.info(f"  较差域名: {total_domains - excellent_count - good_count} ({(total_domains - excellent_count - good_count)/total_domains*100:.1f}%)")
+        logger.info(f"  优秀域名: {excellent_count} ({excellent_count/max(1, total_domains)*100:.1f}%)")
+        logger.info(f"  良好域名: {good_count} ({good_count/max(1, total_domains)*100:.1f}%)")
+        logger.info(f"  较差域名: {total_domains - excellent_count - good_count} ({(total_domains - excellent_count - good_count)/max(1, total_domains)*100:.1f}%)")
+        logger.info(f"  不稳定域名: {unstable_count} ({unstable_count/max(1, total_domains)*100:.1f}%)")
         
         # 保存域名分析结果
         self.domain_analyzer.save_domain_analysis("domain_analysis.json")
@@ -618,35 +682,50 @@ class StreamChecker:
         
         # 1. 生成优秀域名列表
         domains_list = sorted(excellent_domains)
-        domains_content = "# 优秀域名列表 (自动生成)\n# 更新时间: {}\n\n".format(
-            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        )
+        domains_content = "# 优秀域名列表 (自动生成)\n"
+        domains_content += f"# 更新时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+        domains_content += f"# 生成规则: 成功率>80%，响应时间<2000ms，超时率<30%\n\n"
         
         for domain in domains_list:
             stats = self.domain_analyzer.domain_stats[domain]
-            success_rate = stats['success_count'] / stats['total_count'] * 100
-            domains_content += f"# {success_rate:.1f}% - {len(stats['urls'])}个URL\n{domain}\n"
-        
-        # 2. 生成优秀域名筛选规则（可用于其他工具）
-        rules_content = "# 优秀域名筛选规则\n"
-        rules_content += "# 以下域名在检测中表现优秀，建议优先使用\n\n"
-        
-        for domain in sorted(excellent_domains, 
-                           key=lambda x: self.domain_analyzer.domain_stats[x]['success_count'], 
-                           reverse=True)[:50]:  # 前50名
+            valid_checks = stats['total_count'] - stats['timeout_count']
+            success_rate = stats['success_count'] / valid_checks if valid_checks > 0 else 0
+            timeout_rate = stats['timeout_count'] / stats['total_count'] if stats['total_count'] > 0 else 0
             
-            stats = self.domain_analyzer.domain_stats[domain]
+            avg_response = 0
             if stats['response_times']:
-                avg_time = statistics.mean(stats['response_times'])
-            else:
-                avg_time = 0
+                avg_response = statistics.mean(stats['response_times'])
             
-            rules_content += (
-                f"# {stats['success_count']}/{stats['total_count']} "
-                f"({stats['success_count']/stats['total_count']*100:.1f}%) "
-                f"- {avg_time:.1f}ms\n"
-                f"*{domain}*\n"
-            )
+            domains_content += f"# 成功率: {success_rate*100:.1f}% | "
+            domains_content += f"超时率: {timeout_rate*100:.1f}% | "
+            domains_content += f"平均响应: {avg_response:.1f}ms | "
+            domains_content += f"URL数量: {len(stats['urls'])}\n"
+            domains_content += f"{domain}\n\n"
+        
+        # 2. 生成域名过滤规则
+        rules_content = "# 域名过滤规则 (用于其他工具)\n"
+        rules_content += "# 格式: *域名* 表示匹配该域名的所有子域名\n\n"
+        
+        all_domains = list(self.domain_analyzer.excellent_domains) + \
+                     list(self.domain_analyzer.good_domains)
+        
+        # 按成功率排序
+        sorted_domains = sorted(
+            all_domains,
+            key=lambda x: self.domain_analyzer.domain_stats[x]['success_count'] / 
+                         max(1, self.domain_analyzer.domain_stats[x]['total_count'] - 
+                             self.domain_analyzer.domain_stats[x]['timeout_count']),
+            reverse=True
+        )
+        
+        for domain in sorted_domains[:100]:  # 前100名
+            stats = self.domain_analyzer.domain_stats[domain]
+            valid_checks = stats['total_count'] - stats['timeout_count']
+            success_rate = stats['success_count'] / valid_checks if valid_checks > 0 else 0
+            
+            rules_content += f"# 成功率: {success_rate*100:.1f}% "
+            rules_content += f"({stats['success_count']}/{valid_checks})\n"
+            rules_content += f"*{domain}*\n\n"
         
         # 保存文件
         try:
@@ -685,21 +764,19 @@ class StreamChecker:
         
         # 3. 清理和去重所有链接
         cleaned_lines = self.clean_and_deduplicate(all_lines)
+        logger.info(f"清理去重后链接数: {len(cleaned_lines)}")
         
         # 4. 批量检测
-        success_list, failed_list = self.process_batch_urls(cleaned_lines, whitelist_set)
+        success_list, failed_list, timeout_list = self.process_batch_urls(cleaned_lines, whitelist_set)
         
         # 5. 分析并显示优秀域名
         self.print_excellent_domains_report()
         
         # 6. 保存结果
-        self.save_results(success_list, failed_list)
+        self.save_results(success_list, failed_list, timeout_list)
         
-        # 7. 保存缓存
-        self.save_cache()
-        
-        # 8. 输出统计信息
-        self.print_statistics(cleaned_lines, success_list, failed_list)
+        # 7. 输出统计信息
+        self.print_statistics(cleaned_lines, success_list, failed_list, timeout_list)
     
     def get_file_paths(self):
         """获取文件路径"""
@@ -716,7 +793,7 @@ class StreamChecker:
             "whitelist_auto_tv": os.path.join(current_dir, 'whitelist_auto_tv.txt')
         }
     
-    def save_results(self, success_list: List[str], failed_list: List[str]):
+    def save_results(self, success_list: List[str], failed_list: List[str], timeout_list: List[str]):
         """保存检测结果"""
         bj_time = datetime.now(timezone.utc) + timedelta(hours=8)
         version = f"{bj_time.strftime('%Y%m%d %H:%M')},url"
@@ -738,7 +815,7 @@ class StreamChecker:
             "whitelist,#genre#"
         ] + success_tv
         
-        # 准备失败列表
+        # 准备失败列表（包括超时的，根据配置）
         failed_output = [
             "更新时间,#genre#",
             version,
@@ -751,6 +828,17 @@ class StreamChecker:
         self.write_list(file_paths["whitelist_auto"], success_output)
         self.write_list(file_paths["whitelist_auto_tv"], success_tv_output)
         self.write_list(file_paths["blacklist_auto"], failed_output)
+        
+        # 保存超时列表到单独文件（如果需要）
+        if timeout_list and Config.SKIP_TIMEOUT_URLS:
+            timeout_output = [
+                "更新时间,#genre#",
+                version,
+                "",
+                "timeout,#genre#"
+            ] + timeout_list
+            self.write_list("timeout_list.txt", timeout_output)
+            logger.info(f"超时链接已保存到: timeout_list.txt ({len(timeout_list)}个)")
     
     def write_list(self, file_path: str, data_list: List[str]):
         """写入列表到文件"""
@@ -761,28 +849,62 @@ class StreamChecker:
         except Exception as e:
             logger.error(f"写入文件失败 {file_path}: {e}")
     
-    def print_statistics(self, cleaned_lines: List[str], success_list: List[str], failed_list: List[str]):
+    def print_statistics(self, cleaned_lines: List[str], success_list: List[str], 
+                        failed_list: List[str], timeout_list: List[str]):
         """打印统计信息"""
         end_time = datetime.now()
         elapsed = end_time - self.timestart
         mins, secs = int(elapsed.total_seconds() // 60), int(elapsed.total_seconds() % 60)
         
+        total_detected = len(success_list) + len(failed_list)
+        if Config.SKIP_TIMEOUT_URLS:
+            total_detected += len(timeout_list)
+        
         logger.info("=" * 60)
         logger.info("最终统计:")
         logger.info(f"  总耗时: {mins}分{secs}秒")
         logger.info(f"  清理后链接数: {len(cleaned_lines)}")
+        logger.info(f"  检测链接数: {total_detected}")
         logger.info(f"  成功链接数: {len(success_list)}")
         logger.info(f"  失败链接数: {len(failed_list)}")
+        logger.info(f"  超时链接数: {len(timeout_list)}")
         
-        if cleaned_lines:
-            success_rate = len(success_list) / len(cleaned_lines) * 100
+        if total_detected > 0:
+            success_rate = len(success_list) / total_detected * 100
             logger.info(f"  整体成功率: {success_rate:.1f}%")
+            
+            if timeout_list:
+                timeout_rate = len(timeout_list) / total_detected * 100
+                logger.info(f"  超时率: {timeout_rate:.1f}%")
+        
+        # 显示最快的5个和最慢的5个链接
+        if success_list:
+            sorted_success = sorted(success_list, 
+                                  key=lambda x: float(x.split(',')[0].replace('ms', '')))
+            
+            logger.info(f"  最快5个链接:")
+            for i, link in enumerate(sorted_success[:5]):
+                parts = link.split(',', 1)
+                time_str = parts[0]
+                name = parts[1].split(',')[0] if ',' in parts[1] else "Unknown"
+                logger.info(f"    {i+1}. {time_str} - {name[:30]}")
+            
+            logger.info(f"  最慢5个链接:")
+            for i, link in enumerate(sorted_success[-5:][::-1]):
+                parts = link.split(',', 1)
+                time_str = parts[0]
+                name = parts[1].split(',')[0] if ',' in parts[1] else "Unknown"
+                logger.info(f"    {i+1}. {time_str} - {name[:30]}")
         
         logger.info("=" * 60)
+
 
 def main():
     """主函数"""
     logger.info("开始直播源检测和域名质量分析...")
+    logger.info(f"配置: 超时={Config.TIMEOUT_CHECK}s, 线程={Config.MAX_WORKERS}, 重试={Config.MAX_RETRIES}")
+    logger.info(f"超时处理: {'跳过' if Config.SKIP_TIMEOUT_URLS else '算作失败'}")
+    
     checker = StreamChecker()
     
     try:
@@ -793,6 +915,7 @@ def main():
         logger.error(f"检测过程发生错误: {e}", exc_info=True)
     finally:
         logger.info("检测结束")
+
 
 if __name__ == "__main__":
     main()
